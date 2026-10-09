@@ -100,12 +100,15 @@ private:
   std::pair<SmallVector<Value>, Value>
   shuffleValues(Location loc, SmallVector<Value> values, Value lane,
                 ConversionPatternRewriter &rewriter,
-                std::optional<unsigned> upDistance) const {
+                std::optional<int> shuffleDistance) const {
     Value sourceInBounds;
     for (auto [index, value] : llvm::enumerate(values)) {
-      if (upDistance) {
+      if (shuffleDistance) {
         auto [shuffled, inBounds] =
-            targetInfo.shuffleUp(rewriter, loc, value, *upDistance);
+            *shuffleDistance > 0
+                ? targetInfo.shuffleUp(rewriter, loc, value, *shuffleDistance)
+                : targetInfo.shuffleDown(rewriter, loc, value,
+                                         -*shuffleDistance);
         value = shuffled;
         // All tuple members read the same source lane.
         if (index == 0)
@@ -121,7 +124,7 @@ private:
                                   int distance, unsigned segmentsPerScan,
                                   unsigned numSegments) {
     unsigned mask = segmentsPerScan - 1;
-    Value shifted = b.and_(b.add(index, b.i32_val(distance)), b.i32_val(mask));
+    Value shifted = b.and_(b.sub(index, b.i32_val(distance)), b.i32_val(mask));
     if (segmentsPerScan == numSegments)
       return shifted;
     return b.or_(b.and_(index, b.i32_val(~mask)), shifted);
@@ -188,49 +191,43 @@ private:
     if (numSegments != axisSize)
       segmentIndex = b.and_(index, b.i32_val(numSegments - 1));
 
-    const auto &laneBases = layout.getBases().find(kLane)->second;
+    unsigned warpSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(
+        op->getParentOfType<ModuleOp>());
     auto shuffleBoundsMatch = [&](unsigned distance, unsigned laneDistance) {
-      // Both bounds tests ask whether a quotient is nonzero. Division by
-      // these powers of two drops low bits, so checking the lane bases proves
-      // segmentIndex / distance == laneId / laneDistance for every lane.
-      for (auto [bit, basis] : llvm::enumerate(laneBases)) {
-        unsigned segment = basis[axis] & (numSegments - 1);
-        if (segment / distance != (1u << bit) / laneDistance)
-          return false;
-      }
-      return true;
+      // A shuffle crosses the scan boundary exactly when it crosses
+      // the physical warp boundary.
+      return numSegments / distance == warpSize / laneDistance;
     };
-    // Depending on the interval, we maybe able to use shuffleUp or shuffleIdx.
-    // The former is more efficient, but it only works when the distance is a
-    // power of 2. The latter is more general, but it requires a lane index to
-    // be computed and passed in.
-    SmallVector<std::tuple<Value, Value, std::optional<unsigned>>> rounds;
+    // Use shuffleUp or shuffleDown when the layout gives a constant lane
+    // distance. Otherwise, use shuffleIdx with a computed source lane.
+    SmallVector<std::tuple<Value, Value, std::optional<int>>> rounds;
     for (unsigned offset = 1; offset < numLanes; offset *= 2) {
       int distance = offset * numRegs;
-      auto upDistance =
-          getShuffleUpDistance(layout, inverseLayout, axis, numSegments,
-                               reverse ? -distance : distance);
+      auto shuffleDistance =
+          getShuffleDistance(layout, inverseLayout, axis, numSegments,
+                             reverse ? -distance : distance);
       Value lane;
-      if (!upDistance) {
+      if (!shuffleDistance) {
         auto source = coords;
         source[axis].second = shiftWithinSegment(
-            b, index, reverse ? distance : -distance, numSegments, axisSize);
+            b, index, reverse ? -distance : distance, numSegments, axisSize);
         lane = applyLinearLayout(loc, rewriter, inverseLayout, source)
                    .back()
                    .second;
       }
       Value logicalBounds;
-      if (!upDistance || !shuffleBoundsMatch(distance, *upDistance))
+      if (!shuffleDistance ||
+          !shuffleBoundsMatch(distance, std::abs(*shuffleDistance)))
         logicalBounds = reverse ? b.icmp_ult(segmentIndex,
                                              b.i32_val(numSegments - distance))
                                 : b.icmp_uge(segmentIndex, b.i32_val(distance));
-      rounds.emplace_back(lane, logicalBounds, upDistance);
+      rounds.emplace_back(lane, logicalBounds, shuffleDistance);
     }
     for (unsigned base = 0; base < values.size(); base += numRegs) {
       unsigned last = base + (reverse ? 0 : numRegs - 1);
-      for (auto [lane, logicalBounds, upDistance] : rounds) {
+      for (auto [lane, logicalBounds, shuffleDistance] : rounds) {
         auto [incoming, sourceInBounds] =
-            shuffleValues(loc, values[last], lane, rewriter, upDistance);
+            shuffleValues(loc, values[last], lane, rewriter, shuffleDistance);
         Value pred = logicalBounds ? logicalBounds : sourceInBounds;
         for (unsigned r = base; r < base + numRegs; ++r)
           values[r] =
@@ -521,11 +518,12 @@ private:
                         /*skipTerminal=*/true);
   }
 
-  static std::optional<unsigned>
-  getShuffleUpDistance(const LinearLayout &layout,
-                       const LinearLayout &inverseLayout, unsigned axis,
-                       unsigned segmentsPerScan, int distance) {
-    if (distance <= 0 || unsigned(distance) >= segmentsPerScan)
+  static std::optional<int>
+  getShuffleDistance(const LinearLayout &layout,
+                     const LinearLayout &inverseLayout, unsigned axis,
+                     unsigned segmentsPerScan, int distance) {
+    unsigned magnitude = std::abs(distance);
+    if (magnitude == 0 || magnitude >= segmentsPerScan)
       return std::nullopt;
     auto *ctx = layout.getInDimNames().begin()->getContext();
     auto kLane = StringAttr::get(ctx, "lane");
@@ -536,7 +534,7 @@ private:
     auto axisDim = StringAttr::get(ctx, "dim" + std::to_string(axis));
     const auto &bases = inverseLayout.getBases().lookup(axisDim);
     unsigned laneDim = inverseLayout.getOutDimIndex(kLane);
-    unsigned first = llvm::Log2_32(distance);
+    unsigned first = llvm::Log2_32(magnitude);
     unsigned stride = bases[first][laneDim];
     if (!llvm::isPowerOf2_32(stride))
       return std::nullopt;
@@ -545,7 +543,7 @@ private:
     for (unsigned bit = first + 1; bit < llvm::Log2_32(segmentsPerScan); ++bit)
       if (bases[bit][laneDim] != (stride << (bit - first)))
         return std::nullopt;
-    return stride;
+    return distance > 0 ? int(stride) : -int(stride);
   }
 
   static SmallVector<unsigned>
@@ -579,14 +577,14 @@ private:
                                  ArrayRef<unsigned> candidates, Value srcReg,
                                  Value srcLane,
                                  ConversionPatternRewriter &rewriter,
-                                 std::optional<unsigned> upDistance,
+                                 std::optional<int> shuffleDistance,
                                  bool laneLocal) const {
     assert(!candidates.empty() && "each segment has a warp-local carry");
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto fetch = [&](unsigned reg) {
       return laneLocal ? totals[reg]
                        : shuffleValues(loc, totals[reg], srcLane, rewriter,
-                                       upDistance)
+                                       shuffleDistance)
                              .first;
     };
     auto carry = fetch(candidates.front());
@@ -619,8 +617,9 @@ private:
     bool laneLocal = inverse.sublayoutIsZero({axis}, {kLane});
     unsigned numSegments = segmentLayout.getOutDimSize(axis);
     SmallVector<ScanCarry> carries;
-    auto upDistance = getShuffleUpDistance(segmentLayout, inverse, op.getAxis(),
-                                           segmentsPerScan, reverse ? -1 : 1);
+    auto shuffleDistance =
+        getShuffleDistance(segmentLayout, inverse, op.getAxis(),
+                           segmentsPerScan, reverse ? -1 : 1);
     for (unsigned r = 0; r < segmentLayout.getInDimSize(kReg); ++r) {
       auto coords = applyLinearLayout(loc, rewriter, segmentLayout,
                                       {{kReg, b.i32_val(r)},
@@ -634,7 +633,7 @@ private:
       Value pred = b.icmp_ne(segmentInScan,
                              b.i32_val(reverse ? segmentsPerScan - 1 : 0));
       coords[op.getAxis()].second = shiftWithinSegment(
-          b, segment, reverse ? 1 : -1, segmentsPerScan, numSegments);
+          b, segment, reverse ? -1 : 1, segmentsPerScan, numSegments);
       auto src = applyLinearLayout(loc, rewriter, inverse, coords);
       Value srcReg = src[0].second;
       Value srcLane = src[1].second;
@@ -642,7 +641,7 @@ private:
           getScanRegisters(segmentLayout, inverse, r, op.getAxis(),
                            segmentsPerScan, reverse ? 1 : -1);
       auto carry = gatherCarry(loc, totals, candidates, srcReg, srcLane,
-                               rewriter, upDistance, laneLocal);
+                               rewriter, shuffleDistance, laneLocal);
       carries.push_back({std::move(carry), pred});
     }
     return carries;

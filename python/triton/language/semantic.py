@@ -872,6 +872,14 @@ class TritonSemantic(Generic[TensorTy]):
                                  "Source scalar type is " + str(src_sca_ty) + " and destination type is " +
                                  str(dst_sca_ty))
 
+        # NVIDIA's FP8 lowering only implements RTZ conversion to fp8e5 from fp32.
+        if self.builder.options.backend_name == "cuda" and fp_downcast_rounding == ir.ROUNDING_MODE.RTZ:
+            src_is_fp8_rtz_source = src_sca_ty.is_fp32() or src_sca_ty.is_fp16() or src_sca_ty.is_bf16()
+            unsupported_fp8 = src_is_fp8_rtz_source and (dst_sca_ty.is_fp8e4nv() or
+                                                         (dst_sca_ty.is_fp8e5() and not src_sca_ty.is_fp32()))
+            if unsupported_fp8:
+                raise ValueError(f"RTZ conversion from {src_sca_ty} to {dst_sca_ty} is not supported on NVIDIA")
+
         # Keep FP16 <-> BF16 intact so backends can select a native conversion.
         if (src_sca_ty.is_bf16() and dst_sca_ty.is_fp16()) or (src_sca_ty.is_fp16() and dst_sca_ty.is_bf16()):
             return self.make_tensor(

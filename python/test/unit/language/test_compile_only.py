@@ -349,6 +349,64 @@ def test_num_ctas_invalid(num_ctas):
         backend.parse_options({"num_ctas": num_ctas})
 
 
+@pytest.mark.parametrize(
+    "source,destination",
+    [
+        ("fp16", "fp8e4nv"),
+        ("fp32", "fp8e4nv"),
+        ("fp16", "fp8e5"),
+        ("bf16", "fp8e5"),
+    ],
+)
+def test_nvidia_fp8_rtz_unsupported_rejected(source, destination):
+    destination_dtypes = {
+        "fp8e4nv": tl.float8e4nv,
+        "fp8e5": tl.float8e5,
+    }
+
+    @triton.jit
+    def kernel(input_ptr, output_ptr, DST: tl.constexpr):
+        offsets = tl.arange(0, 128)
+        values = tl.load(input_ptr + offsets)
+        converted = values.to(DST, fp_downcast_rounding="rtz")
+        tl.store(output_ptr + offsets, converted)
+
+    src = ASTSource(
+        fn=kernel,
+        signature={"input_ptr": f"*{source}", "output_ptr": f"*{destination}", "DST": "constexpr"},
+        constexprs={"DST": destination_dtypes[destination]},
+    )
+    with pytest.raises(triton.CompilationError) as exc_info:
+        triton.compile(src, target=GPUTarget("cuda", 89, 32))
+    expected = f"RTZ conversion from {source} to {destination} is not supported on NVIDIA"
+    assert expected in str(exc_info.value)
+
+
+def test_nvidia_fp8_rtz_supported_f32_to_e5():
+
+    @triton.jit
+    def kernel(input_ptr, output_ptr):
+        offsets = tl.arange(0, 128)
+        values = tl.load(input_ptr + offsets)
+        converted = values.to(tl.float8e5, fp_downcast_rounding="rtz")
+        tl.store(output_ptr + offsets, converted)
+
+    src = ASTSource(fn=kernel, signature={"input_ptr": "*fp32", "output_ptr": "*fp8e5"})
+    triton.compile(src, target=GPUTarget("cuda", 89, 32))
+
+
+def test_nvidia_fp8_default_rounding_still_supported():
+
+    @triton.jit
+    def kernel(input_ptr, output_ptr):
+        offsets = tl.arange(0, 128)
+        values = tl.load(input_ptr + offsets)
+        tl.store(output_ptr + offsets, values.to(tl.float8e4nv))
+
+    src = ASTSource(fn=kernel, signature={"input_ptr": "*fp16", "output_ptr": "*fp8e4nv"})
+    triton.compile(src, target=GPUTarget("cuda", 89, 32))
+
+
 def test_compile_only_expect_zero() -> None:
 
     @triton.jit
